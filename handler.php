@@ -9,14 +9,25 @@
 class UploadHandler {
 
     public $allowedExtensions = array();
+    public $disallowedExtensions = array(); // specifically don't allow files of this extension
     public $sizeLimit = null;
     public $inputName = 'qqfile';
-    public $chunksFolder = 'chunks';
+    public $chunksFolder = 'chunks'; // folder to temporarily store partial uploads (chunks)
+    public $subFolders = true; // store uploaded files in an 'id' subFolder
+    public $allowOverwrite = false; // if not storing in subfolders, if someone uploads the a file with the same name as one already uploaded, should it overwrite or uniquely name?
+    public $onComplete = null; // function - will execute when a file has finished uploading
 
     public $chunksCleanupProbability = 0.001; // Once in 1000 requests on avg
     public $chunksExpireIn = 604800; // One week
 
     protected $uploadName;
+
+    /**
+     * Retrieves the uuid for this upload
+     */
+    public function getId() {
+        return $_REQUEST['qquuid'];
+    }
 
     /**
      * Get the original filename
@@ -46,15 +57,21 @@ class UploadHandler {
         return $this->uploadName;
     }
 
+    /**
+     * Combine uploaded chunks into a single file & move to the specified directory
+     * @param $uploadDirectory
+     * @param null $name
+     * @return array
+     */
     public function combineChunks($uploadDirectory, $name = null) {
-        $uuid = $_POST['qquuid'];
+        $uuid = $this->getId();
         if ($name === null){
             $name = $this->getName();
         }
-        $targetFolder = $this->chunksFolder.DIRECTORY_SEPARATOR.$uuid;
+        $targetChunkFolder = $this->chunksFolder.DIRECTORY_SEPARATOR.$uuid;
         $totalParts = isset($_REQUEST['qqtotalparts']) ? (int)$_REQUEST['qqtotalparts'] : 1;
 
-        $targetPath = join(DIRECTORY_SEPARATOR, array($uploadDirectory, $uuid, $name));
+        $targetPath = $this->buildPath($uploadDirectory, $name, $uuid);
         $this->uploadName = $name;
 
         if (!file_exists($targetPath)){
@@ -63,7 +80,7 @@ class UploadHandler {
         $target = fopen($targetPath, 'wb');
 
         for ($i=0; $i<$totalParts; $i++){
-            $chunk = fopen($targetFolder.DIRECTORY_SEPARATOR.$i, "rb");
+            $chunk = fopen($targetChunkFolder.DIRECTORY_SEPARATOR.$i, "rb");
             stream_copy_to_stream($chunk, $target);
             fclose($chunk);
         }
@@ -72,10 +89,11 @@ class UploadHandler {
         fclose($target);
 
         for ($i=0; $i<$totalParts; $i++){
-            unlink($targetFolder.DIRECTORY_SEPARATOR.$i);
+            unlink($targetChunkFolder.DIRECTORY_SEPARATOR.$i);
         }
 
-        rmdir($targetFolder);
+        rmdir($targetChunkFolder);
+        $this->uploadComplete();
 
         if (!is_null($this->sizeLimit) && filesize($targetPath) > $this->sizeLimit) {
             unlink($targetPath);
@@ -138,7 +156,7 @@ class UploadHandler {
         if($file['error']) {
             return array('error' => 'Upload Error #'.$file['error']);
         }
-        	
+
         // Validate name
         if ($name === null || $name === ''){
             return array('error' => 'File name empty.');
@@ -154,25 +172,31 @@ class UploadHandler {
         }
 
         // Validate file extension
-        $pathinfo = pathinfo($name);
+        $pathinfo = pathinfo($this->getName());
         $ext = isset($pathinfo['extension']) ? $pathinfo['extension'] : '';
 
-        if($this->allowedExtensions && !in_array(strtolower($ext), array_map("strtolower", $this->allowedExtensions))){
+        if($this->allowedExtensions && !in_array(strtolower($ext), array_map("strtolower", $this->allowedExtensions))) {
             $these = implode(', ', $this->allowedExtensions);
             return array('error' => 'File has an invalid extension, it should be one of '. $these . '.');
+        }
+
+        // check if it is a disallowed extension
+        if($this->disallowedExtensions && in_array(strtolower($ext), array_map("strtolower", $this->disallowedExtensions))) {
+            $these = implode(', ', $this->disallowedExtensions);
+            return array('error' => 'File has an invalid extension, it should not be one of '. $these . '.');
         }
 
         // Save a chunk
         $totalParts = isset($_REQUEST['qqtotalparts']) ? (int)$_REQUEST['qqtotalparts'] : 1;
 
-        $uuid = $_REQUEST['qquuid'];
+        $uuid = $this->getId();
         if ($totalParts > 1){
-        # chunked upload
+            # chunked upload
 
             $chunksFolder = $this->chunksFolder;
             $partIndex = (int)$_REQUEST['qqpartindex'];
 
-            if (!is_writable($chunksFolder) && !is_executable($uploadDirectory)){
+            if (!is_writable($chunksFolder) && !is_executable($chunksFolder)){
                 return array('error' => "Server error. Chunks directory isn't writable or executable.");
             }
 
@@ -189,9 +213,9 @@ class UploadHandler {
 
         }
         else {
-        # non-chunked upload
+            # non-chunked upload
 
-            $target = join(DIRECTORY_SEPARATOR, array($uploadDirectory, $uuid, $name));
+            $target = $this->buildPath($uploadDirectory, $name, $uuid);
 
             if ($target){
                 $this->uploadName = basename($target);
@@ -200,6 +224,7 @@ class UploadHandler {
                     mkdir(dirname($target), 0777, true);
                 }
                 if (move_uploaded_file($file['tmp_name'], $target)){
+                    $this->uploadComplete();
                     return array('success'=> true, "uuid" => $uuid);
                 }
             }
@@ -224,30 +249,57 @@ class UploadHandler {
         $targetFolder = $uploadDirectory;
         $uuid = false;
         $method = $_SERVER["REQUEST_METHOD"];
-	    if ($method == "DELETE") {
+        if ($method == "DELETE") {
             $url = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
             $tokens = explode('/', $url);
             $uuid = $tokens[sizeof($tokens)-1];
         } else if ($method == "POST") {
-            $uuid = $_REQUEST['qquuid'];
+            $uuid = $this->getId();
         } else {
             return array("success" => false,
                 "error" => "Invalid request method! ".$method
             );
         }
+        if ($name === null){
+            $name = $this->getUploadName() ?: $this->getName();
+        }
+        $target = join(DIRECTORY_SEPARATOR, array($targetFolder, $this->subFolders ? $uuid : $name));
 
-        $target = join(DIRECTORY_SEPARATOR, array($targetFolder, $uuid));
-
-        if (is_dir($target)){
+        if ($this->subFolders && is_dir($target)) {
             $this->removeDir($target);
             return array("success" => true, "uuid" => $uuid);
-        } else {
-            return array("success" => false,
-                "error" => "File not found! Unable to delete.".$url,
-                "path" => $uuid
-            );
+        } else if (!$this->subFolders && is_file($target)) {
+            return array("success" => unlink($target), "uuid" => $uuid);
         }
+        return array("success" => false,
+            "error" => "File not found! Unable to delete.".$url,
+            "path" => $uuid
+        );
+    }
 
+    /**
+     * Executes any onComplete function registered
+     */
+    protected function uploadComplete() {
+        if ($this->onComplete) {
+            $this->onComplete->__invoke();
+        }
+    }
+
+    /**
+     * build a target upload path to put the file based on object configuration & the specified parameters
+     * @param $uploadDirectory - directory to place the file
+     * @param $filename - name of the file
+     * @param $uuid - uuid of this upload
+     * @return string target path to upload to
+     */
+    protected function buildPath($uploadDirectory, $filename, $uuid) {
+        if ($this->subFolders) {
+            return join(DIRECTORY_SEPARATOR, array($uploadDirectory, $uuid, $filename));
+        } elseif ($this->allowOverwrite) {
+            return join(DIRECTORY_SEPARATOR, array($uploadDirectory, $filename));
+        }
+        return $this->getUniqueTargetPath($uploadDirectory, $filename);
     }
 
     /**
@@ -341,14 +393,14 @@ class UploadHandler {
      * @param string $str
      */
     protected function toBytes($str){
-	$str = trim($str);
+        $str = trim($str);
         $last = strtolower($str[strlen($str)-1]);
-	$val;
-	if(is_numeric($last)) {
-		$val = (int) $str;
-	} else {
-		$val = (int) substr($str, 0, -1);
-	}
+        $val;
+        if(is_numeric($last)) {
+            $val = (int) $str;
+        } else {
+            $val = (int) substr($str, 0, -1);
+        }
         switch($last) {
             case 'g': case 'G': $val *= 1024;
             case 'm': case 'M': $val *= 1024;
@@ -381,8 +433,8 @@ class UploadHandler {
      */
 
     protected function isWindows() {
-    	$isWin = (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
-    	return $isWin;
+        $isWin = (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
+        return $isWin;
     }
 
 }
